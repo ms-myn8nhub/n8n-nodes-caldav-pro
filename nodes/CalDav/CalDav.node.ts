@@ -32,8 +32,15 @@ import {
 	localDateString,
 	type CalDavEvent,
 } from './GenericFunctions';
+import {
+	assertSafeFeedUrl,
+	expandIcsFeed,
+	fetchIcsFeed,
+	toFeedEvent,
+} from './IcsFeedFunctions';
 import { calendarOperations, calendarFields } from './CalendarDescription';
 import { eventOperations, eventFields } from './EventDescription';
+import { icsFeedOperations, icsFeedFields } from './IcsFeedDescription';
 
 /**
  * Explain a 403 from a write instead of passing "Forbidden" through.
@@ -171,6 +178,69 @@ function readWindowBound(
 }
 
 /**
+ * The window a read operation asks for, plus the predicate applied on top of it.
+ *
+ * Get Many, Get Next and Search differ only in those two things, and they differ
+ * in exactly the same way whether the events come from a CalDAV server or from a
+ * subscribed feed — so both resources read their window here.
+ */
+function readWindow(
+	this: IExecuteFunctions,
+	itemIndex: number,
+	operation: string,
+): { rangeStart: Date; rangeEnd: Date; accept?: (event: CalDavEvent) => boolean } {
+	if (operation === 'getNext') {
+		const lookaheadDays = this.getNodeParameter('lookaheadDays', itemIndex, 30) as number;
+		if (!Number.isFinite(lookaheadDays) || lookaheadDays <= 0) {
+			throw new NodeOperationError(
+				this.getNode(),
+				`Lookahead Days must be a positive number, got ${lookaheadDays}.`,
+				{
+					itemIndex,
+					// The minValue in the UI does not constrain expressions.
+					description: 'A zero or negative window can never contain an event.',
+				},
+			);
+		}
+		const rangeStart = new Date();
+		const rangeEnd = new Date(rangeStart.getTime() + lookaheadDays * 24 * 60 * 60 * 1000);
+		// A series can start before "now" and still have an occurrence inside the
+		// window; only drop the ones already past.
+		const today = localDateString(rangeStart, this.getTimezone());
+		return {
+			rangeStart,
+			rangeEnd,
+			accept: (event) => {
+				if (!event.start) return true;
+				if (event.allDay) return event.end ? event.end > today : event.start >= today;
+				return new Date(event.start) >= rangeStart;
+			},
+		};
+	}
+
+	const rangeStart = readWindowBound.call(this, itemIndex, 'timeMin', 'Time Min');
+	const rangeEnd = readWindowBound.call(this, itemIndex, 'timeMax', 'Time Max');
+	// An inverted or empty window is silently answered with an empty result by
+	// the server, which reads as "no events" rather than as the mistake it is.
+	if (rangeEnd.getTime() <= rangeStart.getTime()) {
+		throw new NodeOperationError(
+			this.getNode(),
+			`Time Max must be after Time Min (got ${rangeStart.toISOString()} to ${rangeEnd.toISOString()}).`,
+			{
+				itemIndex,
+				description:
+					'The window is empty or reversed, so it can never match an event. Check the order of the two fields.',
+			},
+		);
+	}
+	if (operation === 'search') {
+		const query = this.getNodeParameter('query', itemIndex) as string;
+		return { rangeStart, rangeEnd, accept: (event) => eventMatchesText(event, query) };
+	}
+	return { rangeStart, rangeEnd };
+}
+
+/**
  * Run a time-range REPORT across one or every calendar and return the matching
  * events, sorted by start.
  *
@@ -262,9 +332,27 @@ export class CalDav implements INodeType {
 		inputs: ['main'],
 		outputs: ['main'],
 		credentials: [
+			// Each credential is required only for the resource that uses it. An ICS
+			// feed is fetched unauthenticated, so demanding a CalDAV account before a
+			// public holiday calendar can be read would be both pointless and an
+			// invitation to aim that account at somebody else's server.
 			{
 				name: 'calDavApi',
 				required: true,
+				displayOptions: {
+					show: {
+						resource: ['calendar', 'event'],
+					},
+				},
+			},
+			{
+				name: 'icsFeedApi',
+				required: true,
+				displayOptions: {
+					show: {
+						resource: ['icsFeed'],
+					},
+				},
 			},
 		],
 		properties: [
@@ -276,6 +364,7 @@ export class CalDav implements INodeType {
 				options: [
 					{ name: 'Calendar', value: 'calendar' },
 					{ name: 'Event', value: 'event' },
+					{ name: 'ICS Feed (Read-Only)', value: 'icsFeed' },
 				],
 				default: 'event',
 			},
@@ -283,6 +372,8 @@ export class CalDav implements INodeType {
 			...calendarFields,
 			...eventOperations,
 			...eventFields,
+			...icsFeedOperations,
+			...icsFeedFields,
 		],
 	};
 
@@ -335,7 +426,18 @@ export class CalDav implements INodeType {
 
 		const resource = this.getNodeParameter('resource', 0) as string;
 		const operation = this.getNodeParameter('operation', 0) as string;
-		const creds = await this.getCredentials('calDavApi');
+		// The feed resource must not touch the CalDAV credential at all — not even
+		// to read it. Asking for it here would make the node unusable with only a
+		// feed configured, and would put an account's password one mistake away
+		// from a request aimed at an external host.
+		const creds: IDataObject =
+			resource === 'icsFeed' ? {} : ((await this.getCredentials('calDavApi')) as IDataObject);
+		// Unlike node parameters, credentials do not vary per input item. Read the
+		// secret once so multiple input items still issue only one credential lookup.
+		const feedCreds =
+			resource === 'icsFeed'
+				? ((await this.getCredentials('icsFeedApi')) as { feedUrl?: string; feedName?: string })
+				: undefined;
 		const serverUrl = creds.serverUrl as string;
 		const username = creds.username as string;
 
@@ -478,57 +580,7 @@ export class CalDav implements INodeType {
 						const returnAll = this.getNodeParameter('returnAll', i) as boolean;
 						const limit = returnAll ? Infinity : (this.getNodeParameter('limit', i) as number);
 						const simplify = this.getNodeParameter('simplify', i, true) as boolean;
-
-						let rangeStart: Date;
-						let rangeEnd: Date;
-						let accept: ((event: CalDavEvent) => boolean) | undefined;
-
-						if (operation === 'getNext') {
-							const lookaheadDays = this.getNodeParameter('lookaheadDays', i, 30) as number;
-							if (!Number.isFinite(lookaheadDays) || lookaheadDays <= 0) {
-								throw new NodeOperationError(
-									this.getNode(),
-									`Lookahead Days must be a positive number, got ${lookaheadDays}.`,
-									{
-										itemIndex: i,
-										// The minValue in the UI does not constrain expressions.
-										description: 'A zero or negative window can never contain an event.',
-									},
-								);
-							}
-							rangeStart = new Date();
-							rangeEnd = new Date(rangeStart.getTime() + lookaheadDays * 24 * 60 * 60 * 1000);
-							// A series can start before "now" and still have an occurrence
-							// inside the window; only drop the ones already past.
-							const from = rangeStart;
-							const today = localDateString(from, this.getTimezone());
-							accept = (event) => {
-								if (!event.start) return true;
-								if (event.allDay) return event.end ? event.end > today : event.start >= today;
-								return new Date(event.start) >= from;
-							};
-						} else {
-							rangeStart = readWindowBound.call(this, i, 'timeMin', 'Time Min');
-							rangeEnd = readWindowBound.call(this, i, 'timeMax', 'Time Max');
-							// An inverted or empty window is silently answered with an empty
-							// result by the server, which reads as "no events" rather than
-							// as the mistake it is.
-							if (rangeEnd.getTime() <= rangeStart.getTime()) {
-								throw new NodeOperationError(
-									this.getNode(),
-									`Time Max must be after Time Min (got ${rangeStart.toISOString()} to ${rangeEnd.toISOString()}).`,
-									{
-										itemIndex: i,
-										description:
-											'The window is empty or reversed, so it can never match an event. Check the order of the two fields.',
-									},
-								);
-							}
-							if (operation === 'search') {
-								const query = this.getNodeParameter('query', i) as string;
-								accept = (event) => eventMatchesText(event, query);
-							}
-						}
+						const { rangeStart, rangeEnd, accept } = readWindow.call(this, i, operation);
 
 						const collected = await collectEvents.call(this, {
 							calendarUrl: calUrlNormalised,
@@ -794,6 +846,62 @@ export class CalDav implements INodeType {
 						returnData.push({ json: { uid, url: eventUrl, deleted: true }, pairedItem: { item: i } });
 					} else {
 						throw new NodeOperationError(this.getNode(), `Unknown event operation: ${operation}`);
+					}
+				} else if (resource === 'icsFeed') {
+					if (!['getAll', 'getNext', 'search'].includes(operation)) {
+						throw new NodeOperationError(
+							this.getNode(),
+							`Unknown ICS feed operation: ${operation}`,
+							{
+								itemIndex: i,
+								description:
+									'A subscribed feed is read-only: only Get Many, Get Next and Search are available. Use the Event resource to write to a calendar.',
+							},
+						);
+					}
+					const currentFeedCreds = feedCreds!;
+					const feedName = (currentFeedCreds.feedName ?? '').trim() || undefined;
+					// Checked here, separately from the fetch, so a bad address is
+					// reported against the credential rather than as a failed request —
+					// and so no request is made at all.
+					let feedUrl: string;
+					try {
+						feedUrl = assertSafeFeedUrl(String(currentFeedCreds.feedUrl ?? ''));
+					} catch (err) {
+						throw new NodeOperationError(this.getNode(), (err as Error).message, {
+							itemIndex: i,
+							description:
+								'Open the ICS Feed credential and check the Feed URL. Only public HTTPS or webcal feeds on port 443 can be read.',
+						});
+					}
+
+					const returnAll = this.getNodeParameter('returnAll', i) as boolean;
+					const limit = returnAll ? Infinity : (this.getNodeParameter('limit', i) as number);
+					const simplify = this.getNodeParameter('simplify', i, true) as boolean;
+					const { rangeStart, rangeEnd, accept } = readWindow.call(this, i, operation);
+
+					// One unauthenticated GET, memoised for the whole execution. Every
+					// failure it can produce is already curated: no feed URL, no host,
+					// no response body.
+					let body: string;
+					try {
+						body = await fetchIcsFeed.call(this, feedUrl);
+					} catch (err) {
+						throw new NodeOperationError(this.getNode(), (err as Error).message, {
+							itemIndex: i,
+						});
+					}
+
+					// A feed is one static file, so the window is applied here rather
+					// than by a server-side query.
+					const events = expandIcsFeed(body, rangeStart, rangeEnd, this.getTimezone())
+						.filter((event) => !accept || accept(event))
+						.sort((a, b) => String(a.start ?? '').localeCompare(String(b.start ?? '')));
+					for (const event of events.slice(0, limit)) {
+						returnData.push({
+							json: toFeedEvent(event, feedName, simplify),
+							pairedItem: { item: i },
+						});
 					}
 				} else {
 					throw new NodeOperationError(this.getNode(), `Unknown resource: ${resource}`);

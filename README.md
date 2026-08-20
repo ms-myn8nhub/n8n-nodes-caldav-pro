@@ -163,6 +163,32 @@ Name it `n8n-caldav`.
 
 > Versions before 2.7.0 additionally shifted timed events by the *n8n host's* UTC offset whenever **Timezone** was set, and wrote all-day events on the wrong calendar date. If you created events with an older version, re-check their times.
 
+## External ICS / WebCal Feeds (Read-Only)
+
+Use **Resource** = `ICS Feed (Read-Only)` for subscribed calendars that are not
+exposed as CalDAV collections — for example Foodsharing, school holidays,
+club schedules, or public holiday feeds. It supports **Get Many**, **Get Next**,
+and **Search**; writing, moving, or deleting a feed event is intentionally not
+available.
+
+1. Create an **ICS Feed API** credential.
+2. Paste the subscription link into **Feed URL**. `https://`, `webcal://`, and
+   `webcals://` links are supported; `webcal` is retrieved via HTTPS.
+3. Optionally set **Feed Name** (for example `Foodsharing`). It is returned as
+   `feedName` with every event, while the subscription URL is never exposed in
+   output or error messages.
+4. Select the `ICS Feed (Read-Only)` resource and one of the read operations.
+
+> Treat the subscription link like a password: it commonly contains a personal
+> token that grants read access to the whole calendar. It belongs only in the
+> ICS Feed credential, never in a node field, workflow JSON, log, or chat.
+>
+> For SSRF safety, the node accepts public HTTPS hostnames on port 443 only and
+> rejects local/private names, IP addresses, custom ports, and redirects to a
+> different origin. DNS rebinding cannot be fully prevented in a Node.js client;
+> restrict outbound network access from your n8n host if untrusted users can
+> edit feed credentials.
+
 ## AI Agent Usage
 
 The node is declared `usableAsTool: true` with LLM-friendly descriptions on every parameter. An AI Agent can call it directly from a chat prompt. Example:

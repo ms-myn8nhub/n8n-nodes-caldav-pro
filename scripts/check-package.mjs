@@ -7,7 +7,7 @@
  * Neither breaks a test, so only a check like this catches them.
  */
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 
 const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
@@ -24,6 +24,16 @@ const problems = [];
 // silently fails to register after install.
 for (const declared of [...(pkg.n8n?.nodes ?? []), ...(pkg.n8n?.credentials ?? [])]) {
 	if (!files.includes(declared)) problems.push(`n8n manifest points at a missing file: ${declared}`);
+}
+
+// A credential class that is written but never declared installs as a node with
+// a credential type n8n has never heard of, which fails only in the editor.
+for (const source of readdirSync(new URL('../credentials', import.meta.url))) {
+	if (!source.endsWith('.credentials.ts')) continue;
+	const declared = `dist/credentials/${source.replace(/\.ts$/, '.js')}`;
+	if (!(pkg.n8n?.credentials ?? []).includes(declared)) {
+		problems.push(`credential is not declared in the n8n manifest: ${declared}`);
+	}
 }
 
 const required = ['package.json', 'LICENSE', 'README.md', 'CHANGELOG.md', 'dist/nodes/CalDav/CalDav.node.json'];

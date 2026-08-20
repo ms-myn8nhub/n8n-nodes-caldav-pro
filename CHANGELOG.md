@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **External ICS Feed** read-only resource for subscribed `https://`, `webcal://`,
+  and `webcals://` calendars. It supports Get Many, Get Next, and Search while
+  preserving recurring-event, timezone, all-day, and reminder parsing.
+- A separate **ICS Feed API** credential stores token-bearing subscription links
+  as a secret. Feed events expose `source: "icsFeed"` and an optional Feed Name,
+  never the subscription URL.
+
+### Security
+
+- External feed requests never use CalDAV authentication and send no credentials
+  or cookies. Only public HTTPS hosts on port 443 are accepted; local/private
+  names, IP literals, custom ports, and cross-origin or unsafe redirects are
+  rejected without exposing the feed URL in errors or workflow output.
+
 ## [3.4.1]
 
 ### Security
