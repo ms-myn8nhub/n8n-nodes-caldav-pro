@@ -12,6 +12,7 @@ import { NodeApiError, NodeOperationError } from 'n8n-workflow';
 import { randomUUID } from 'crypto';
 
 import {
+	absoluteUrl,
 	davRequest,
 	discoverCalendars,
 	buildICalEvent,
@@ -26,6 +27,9 @@ import {
 	seriesRecurrenceRule,
 	simplifyEvent,
 	eventMatchesText,
+	etagValue,
+	ifMatchHeader,
+	localDateString,
 	type CalDavEvent,
 } from './GenericFunctions';
 import { calendarOperations, calendarFields } from './CalendarDescription';
@@ -88,6 +92,28 @@ function guardRecurringSeries(
 }
 
 /**
+ * Origin-check a URL the caller supplied, naming the field it came from.
+ *
+ * "Calendar" and "Target Calendar" are options parameters, but an expression —
+ * or an AI Agent filling the tool schema — can put any string in them, and the
+ * credential's Basic auth rides along on whatever we then request. Checking
+ * here keeps that decision ahead of the first authenticated request.
+ */
+function checkedUrl(
+	this: IExecuteFunctions,
+	url: string,
+	serverUrl: string,
+	field: string,
+	itemIndex: number,
+): string {
+	try {
+		return absoluteUrl(url, serverUrl, field);
+	} catch (error) {
+		throw new NodeOperationError(this.getNode(), (error as Error).message, { itemIndex });
+	}
+}
+
+/**
  * Work out which resource an operation should act on, from whichever of
  * Event URL / Event UID the caller supplied.
  */
@@ -110,7 +136,15 @@ async function locateEvent(
 			},
 		);
 	}
-	const eventUrl = await resolveEventUrl.call(this, calendarUrl, uid, explicitUrl, serverUrl);
+	// An explicit Event URL is origin-checked inside resolveEventUrl, before it
+	// makes any request; surface that as a node error against this item.
+	let eventUrl: string;
+	try {
+		eventUrl = await resolveEventUrl.call(this, calendarUrl, uid, explicitUrl, serverUrl);
+	} catch (error) {
+		if (error instanceof NodeOperationError || error instanceof NodeApiError) throw error;
+		throw new NodeOperationError(this.getNode(), (error as Error).message, { itemIndex });
+	}
 	return { uid, eventUrl };
 }
 
@@ -158,13 +192,13 @@ async function collectEvents(
 	const { calendarUrl, serverUrl, username, rangeStart, rangeEnd, simplify, accept } = opts;
 
 	// Either the picked calendar, or every visible one for "All Calendars".
-	const targets =
-		calendarUrl === '__ALL__'
-			? (await discoverCalendars.call(this, serverUrl, username)).map((c) => ({
-					url: c.url.endsWith('/') ? c.url : `${c.url}/`,
-					displayName: c.displayName,
-				}))
-			: [{ url: calendarUrl, displayName: '' }];
+	const fanOut = calendarUrl === '__ALL__';
+	const targets = fanOut
+		? (await discoverCalendars.call(this, serverUrl, username)).map((c) => ({
+				url: c.url.endsWith('/') ? c.url : `${c.url}/`,
+				displayName: c.displayName,
+			}))
+		: [{ url: calendarUrl, displayName: '' }];
 
 	// Events stored in plain UTC carry no zone of their own; the workflow's
 	// timezone is the closest thing to the reader's for rendering *Local.
@@ -196,6 +230,12 @@ async function collectEvents(
 		} catch (err) {
 			// Skip calendars that reject REPORT (read-only feeds, schedule inbox);
 			// one bad collection shouldn't fail a cross-calendar read.
+			//
+			// Only when we are fanning out, though. On the one calendar the caller
+			// picked, swallowing the error turns an expired app password or a
+			// revoked share into "no events" — the one answer a workflow, or an
+			// agent speaking for the user, must never be given.
+			if (!fanOut) throw err;
 			this.logger?.debug(`[CalDAV] REPORT skipped for ${target.url}: ${(err as Error).message}`);
 		}
 	}
@@ -345,14 +385,35 @@ export class CalDav implements INodeType {
 					const calUrlNormalised =
 						resolvedUrl === '__ALL__'
 							? '__ALL__'
-							: resolvedUrl.endsWith('/')
-								? resolvedUrl
-								: `${resolvedUrl}/`;
+							: checkedUrl.call(
+									this,
+									resolvedUrl.endsWith('/') ? resolvedUrl : `${resolvedUrl}/`,
+									serverUrl,
+									'Calendar',
+									i,
+								);
 
 					if (operation === 'create') {
-						const summary = this.getNodeParameter('summary', i) as string;
-						const start = this.getNodeParameter('start', i) as string;
-						const end = this.getNodeParameter('end', i) as string;
+						const summary = String(this.getNodeParameter('summary', i, '') ?? '');
+						const start = String(this.getNodeParameter('start', i, '') ?? '').trim();
+						const end = String(this.getNodeParameter('end', i, '') ?? '').trim();
+						// `required` constrains the editor, not an expression and not an
+						// AI Agent filling the tool schema. Without this the empty value
+						// surfaces as "Invalid ISO 8601 date in Start: ", which names the
+						// symptom rather than the missing field.
+						for (const [label, value] of [
+							['Summary', summary.trim()],
+							['Start', start],
+							['End', end],
+						] as const) {
+							if (!value) {
+								throw new NodeOperationError(
+									this.getNode(),
+									`${label} is required to create an event.`,
+									{ itemIndex: i },
+								);
+							}
+						}
 						const additional = this.getNodeParameter('additionalFields', i, {}) as IDataObject;
 						const attendeesRaw = (additional.attendees as IDataObject)?.attendee as
 							| Array<{ email: string; name?: string }>
@@ -361,19 +422,24 @@ export class CalDav implements INodeType {
 							| Array<{ minutesBefore: number; action?: 'DISPLAY' | 'EMAIL' }>
 							| undefined;
 						const uid = (additional.uid as string) || randomUUID();
-						const iCal = buildICalEvent({
-							uid,
-							summary,
-							start,
-							end,
-							description: additional.description as string | undefined,
-							location: additional.location as string | undefined,
-							allDay: additional.allDay as boolean | undefined,
-							timezone: additional.timezone as string | undefined,
-							rrule: additional.rrule as string | undefined,
-							attendees: attendeesRaw,
-							reminders: remindersRaw,
-						});
+						let iCal: string;
+						try {
+							iCal = buildICalEvent({
+								uid,
+								summary,
+								start,
+								end,
+								description: additional.description as string | undefined,
+								location: additional.location as string | undefined,
+								allDay: additional.allDay as boolean | undefined,
+								timezone: additional.timezone as string | undefined,
+								rrule: additional.rrule as string | undefined,
+								attendees: attendeesRaw,
+								reminders: remindersRaw,
+							});
+						} catch (err) {
+							throw new NodeOperationError(this.getNode(), (err as Error).message, { itemIndex: i });
+						}
 						const eventUrl = `${calUrlNormalised}${encodeURIComponent(uid)}.ics`;
 						const resp = await davRequest
 							.call(this, 'PUT', eventUrl, iCal, {
@@ -381,7 +447,7 @@ export class CalDav implements INodeType {
 								'If-None-Match': '*',
 							})
 							.catch((err) => rethrowWriteError.call(this, err, i, calUrlNormalised));
-						const etag = (resp.headers.etag as string | undefined)?.replace(/"/g, '');
+						const etag = etagValue(resp.headers.etag);
 						returnData.push({
 							json: { uid, url: eventUrl, etag, summary, start, end },
 							pairedItem: { item: i },
@@ -395,7 +461,7 @@ export class CalDav implements INodeType {
 						const parsed = parseICalEvent(
 							resp.body,
 							eventUrl,
-							(resp.headers.etag as string | undefined)?.replace(/"/g, ''),
+							etagValue(resp.headers.etag),
 							this.getTimezone(),
 						);
 						if (!parsed) {
@@ -435,7 +501,12 @@ export class CalDav implements INodeType {
 							// A series can start before "now" and still have an occurrence
 							// inside the window; only drop the ones already past.
 							const from = rangeStart;
-							accept = (event) => !event.start || new Date(event.start) >= from;
+							const today = localDateString(from, this.getTimezone());
+							accept = (event) => {
+								if (!event.start) return true;
+								if (event.allDay) return event.end ? event.end > today : event.start >= today;
+								return new Date(event.start) >= from;
+							};
 						} else {
 							rangeStart = readWindowBound.call(this, i, 'timeMin', 'Time Min');
 							rangeEnd = readWindowBound.call(this, i, 'timeMax', 'Time Max');
@@ -472,7 +543,6 @@ export class CalDav implements INodeType {
 							returnData.push({ json: ev, pairedItem: { item: i } });
 						}
 					} else if (operation === 'move') {
-						const located = await locateEvent.call(this, i, calUrlNormalised, serverUrl);
 						const targetCalendarRaw = this.getNodeParameter('targetCalendar', i) as string;
 						if (!targetCalendarRaw) {
 							throw new NodeOperationError(this.getNode(), 'Target Calendar is required for the Move operation.', { itemIndex: i });
@@ -480,18 +550,25 @@ export class CalDav implements INodeType {
 						if (targetCalendarRaw === '__ALL__') {
 							throw new NodeOperationError(this.getNode(), '"All Calendars" is not a valid target for Move. Pick a specific destination.', { itemIndex: i });
 						}
+						// Both ends are checked before the event is even located, so a
+						// foreign destination cannot be reached by any request at all.
 						const targetUrl =
 							targetCalendarRaw === '__DEFAULT__'
 								? await resolveDefaultCalendar.call(this, serverUrl, username)
-								: targetCalendarRaw.endsWith('/')
-									? targetCalendarRaw
-									: `${targetCalendarRaw}/`;
+								: checkedUrl.call(
+										this,
+										targetCalendarRaw.endsWith('/') ? targetCalendarRaw : `${targetCalendarRaw}/`,
+										serverUrl,
+										'Target Calendar',
+										i,
+									);
+						const located = await locateEvent.call(this, i, calUrlNormalised, serverUrl);
 						if (targetUrl === calUrlNormalised) {
 							throw new NodeOperationError(this.getNode(), 'Source and target calendars are identical — nothing to move.', { itemIndex: i });
 						}
 						const sourceEventUrl = located.eventUrl;
 						const getResp = await davRequest.call(this, 'GET', sourceEventUrl, undefined, { Accept: 'text/calendar' });
-						const sourceEtag = (getResp.headers.etag as string | undefined)?.replace(/"/g, '');
+						const sourceIfMatch = ifMatchHeader(getResp.headers.etag);
 						// The destination filename is derived from the UID. When the event
 						// was addressed by URL we don't have one yet, so read it back out
 						// of the resource we just fetched.
@@ -506,8 +583,25 @@ export class CalDav implements INodeType {
 								'If-None-Match': '*',
 							})
 							.catch((err) => rethrowWriteError.call(this, err, i, targetUrl));
-						const newEtag = (putResp.headers.etag as string | undefined)?.replace(/"/g, '');
-						await davRequest.call(this, 'DELETE', sourceEventUrl, undefined, sourceEtag ? { 'If-Match': `"${sourceEtag}"` } : undefined);
+						const newEtag = etagValue(putResp.headers.etag);
+						try {
+							await davRequest.call(
+								this,
+								'DELETE',
+								sourceEventUrl,
+								undefined,
+								sourceIfMatch ? { 'If-Match': sourceIfMatch } : undefined,
+							);
+						} catch (err) {
+							throw new NodeOperationError(
+								this.getNode(),
+								`Move copied the event to the target calendar, but deleting the source failed. Target copy exists at ${targetEventUrl}; source still exists at ${sourceEventUrl}. Manual cleanup may be required.`,
+								{
+									itemIndex: i,
+									description: `Manual cleanup may be required: remove either the copied target (${targetEventUrl}) or the remaining source (${sourceEventUrl}) after checking which one you want to keep. Original delete error: ${(err as Error).message}`,
+								},
+							);
+						}
 						returnData.push({
 							json: { uid, oldUrl: sourceEventUrl, newUrl: targetEventUrl, etag: newEtag, moved: true },
 							pairedItem: { item: i },
@@ -515,9 +609,13 @@ export class CalDav implements INodeType {
 					} else if (operation === 'update') {
 						const located = await locateEvent.call(this, i, calUrlNormalised, serverUrl);
 						const uid = located.uid;
-						const summary = this.getNodeParameter('summary', i) as string;
-						const start = this.getNodeParameter('start', i) as string;
-						const end = this.getNodeParameter('end', i) as string;
+						// Update is a patch: an empty field means "leave what the server
+						// has", never "clear it". Anything the caller did not fill in has
+						// to reach patchICalEvent as undefined, or a title-only update
+						// would reschedule the event and blank its summary.
+						const summary = String(this.getNodeParameter('summary', i, '') ?? '');
+						const start = String(this.getNodeParameter('start', i, '') ?? '').trim();
+						const end = String(this.getNodeParameter('end', i, '') ?? '').trim();
 						const additional = this.getNodeParameter('additionalFields', i, {}) as IDataObject;
 						const attendeesRaw = (additional.attendees as IDataObject)?.attendee as
 							| Array<{ email: string; name?: string }>
@@ -551,12 +649,19 @@ export class CalDav implements INodeType {
 						}
 						const occurrence = (this.getNodeParameter('recurrenceId', i, '') as string).trim();
 						if (!occurrence) guardRecurringSeries.call(this, existing.body, i, 'update');
-						const currentEtag = (existing.headers.etag as string | undefined)?.replace(/"/g, '');
+						const currentIfMatch = ifMatchHeader(existing.headers.etag);
 
+						const hasStart = start !== '';
+						const hasEnd = end !== '';
+						if (hasStart !== hasEnd) {
+							throw new NodeOperationError(this.getNode(), 'Start and End must be updated together.', {
+								itemIndex: i,
+							});
+						}
 						const patch = {
-							summary,
-							start,
-							end,
+							summary: summary || undefined,
+							start: hasStart ? start : undefined,
+							end: hasEnd ? end : undefined,
 							description: additional.description as string | undefined,
 							location: additional.location as string | undefined,
 							allDay: additional.allDay as boolean | undefined,
@@ -579,7 +684,7 @@ export class CalDav implements INodeType {
 						const putHeaders: Record<string, string> = {
 							'Content-Type': 'text/calendar; charset=utf-8',
 						};
-						if (currentEtag) putHeaders['If-Match'] = `"${currentEtag}"`;
+						if (currentIfMatch) putHeaders['If-Match'] = currentIfMatch;
 						let resp;
 						try {
 							resp = await davRequest.call(this, 'PUT', eventUrl, iCal, putHeaders);
@@ -600,15 +705,15 @@ export class CalDav implements INodeType {
 							}
 							throw err;
 						}
-						const etag = (resp.headers.etag as string | undefined)?.replace(/"/g, '');
+						const etag = etagValue(resp.headers.etag);
 						returnData.push({
 							json: {
 								uid,
 								url: eventUrl,
 								etag,
-								summary,
-								start,
-								end,
+								summary: summary || undefined,
+								start: hasStart ? start : undefined,
+								end: hasEnd ? end : undefined,
 								recurrenceId: occurrence || undefined,
 								updated: true,
 							},
@@ -635,7 +740,7 @@ export class CalDav implements INodeType {
 							}
 							throw err;
 						}
-						const storedEtag = (stored.headers.etag as string | undefined)?.replace(/"/g, '');
+						const storedIfMatch = ifMatchHeader(stored.headers.etag);
 						const occurrence = (this.getNodeParameter('recurrenceId', i, '') as string).trim();
 
 						// Cancelling one date of a series is not a DELETE: the whole
@@ -653,7 +758,7 @@ export class CalDav implements INodeType {
 							const headers: Record<string, string> = {
 								'Content-Type': 'text/calendar; charset=utf-8',
 							};
-							if (storedEtag) headers['If-Match'] = `"${storedEtag}"`;
+							if (storedIfMatch) headers['If-Match'] = storedIfMatch;
 							await davRequest
 								.call(this, 'PUT', eventUrl, excluded, headers)
 								.catch((err) => rethrowWriteError.call(this, err, i, calUrlNormalised));
@@ -671,7 +776,7 @@ export class CalDav implements INodeType {
 								'DELETE',
 								eventUrl,
 								undefined,
-								storedEtag ? { 'If-Match': `"${storedEtag}"` } : undefined,
+								storedIfMatch ? { 'If-Match': storedIfMatch } : undefined,
 							);
 						} catch (err) {
 							if ((err as { httpCode?: string }).httpCode === '412') {

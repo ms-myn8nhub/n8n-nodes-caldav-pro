@@ -48,6 +48,13 @@ describe('buildICalEvent — timezone handling', () => {
 			/Invalid ISO 8601 date in "Start"/,
 		);
 	});
+
+	it('rejects timed events whose end is not after the start', () => {
+		expect(() => buildICalEvent({ ...base, end: base.start })).toThrow(/End must be after Start/);
+		expect(() => buildICalEvent({ ...base, end: '2026-04-20T13:00:00+02:00' })).toThrow(
+			/End must be after Start/,
+		);
+	});
 });
 
 describe('buildICalEvent — all-day events', () => {
@@ -171,7 +178,28 @@ describe('buildICalEvent — serialisation', () => {
 		expect(flat.filter((l) => l === 'BEGIN:VALARM')).toHaveLength(2);
 		expect(flat).toContain('TRIGGER:-PT15M');
 		expect(flat).toContain('TRIGGER:-P1D');
+		expect(flat.filter((l) => l === 'ACTION:DISPLAY')).toHaveLength(2);
+		expect(flat).not.toContain('ACTION:EMAIL');
+	});
+
+	it('writes RFC-compliant EMAIL alarms only when the event has attendees', () => {
+		const ics = buildICalEvent({
+			...base,
+			attendees: [{ email: 'alice@example.com', name: 'Alice' }],
+			reminders: [{ minutesBefore: 1440, action: 'EMAIL' }],
+		});
+		const flat = unfold(ics);
 		expect(flat).toContain('ACTION:EMAIL');
+		expect(flat).toContain('SUMMARY:Team meeting');
+		expect(flat.filter((l) => l.includes('ATTENDEE') && l.includes('mailto:alice@example.com')).length).toBeGreaterThanOrEqual(2);
+	});
+
+	it('falls back to DISPLAY for EMAIL reminders without attendees', () => {
+		const ics = buildICalEvent({ ...base, reminders: [{ minutesBefore: 10, action: 'EMAIL' }] });
+		const flat = unfold(ics);
+		expect(flat).toContain('ACTION:DISPLAY');
+		expect(flat).not.toContain('ACTION:EMAIL');
+		expect(flat.filter((l) => l === 'SUMMARY:Team meeting')).toHaveLength(1);
 	});
 
 	it('accepts an RRULE with or without the redundant prefix', () => {

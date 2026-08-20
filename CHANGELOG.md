@@ -4,6 +4,42 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.1]
+
+### Security
+
+- CalDAV URLs supplied through Calendar, Target Calendar, Event URL, or the
+  credential Default Calendar must stay on the configured server origin, so
+  credential-backed requests cannot be redirected to another host by free-text
+  input.
+
+### Fixed
+
+- Weak ETags returned by CalDAV servers are no longer used as invalid `If-Match`
+  headers on Update, Delete, or Move; strong ETags remain conditional.
+- Move now reports the partial-success state clearly when the target copy was
+  created but deleting the source failed, including both URLs and a cleanup hint.
+- Get Next keeps today's and ongoing multi-day all-day events, respecting
+  exclusive `DTEND` and the workflow timezone.
+- Timed Create and Update reject ranges where End is not after Start; all-day
+  date behavior is unchanged.
+- `EMAIL` VALARMs are only written in RFC-compliant form with `SUMMARY` and
+  `ATTENDEE`; reminders without event attendees fall back to `DISPLAY`.
+- A report error from an explicitly selected calendar is reported instead of
+  being treated as an empty result.
+- Update now patches the stored series master/resource instead of rebuilding from
+  the first expanded VEVENT instance.
+- Create names a missing or invalid Start/End field instead of failing later with
+  an ambiguous date error.
+
+### Changed
+
+- Update is a true patch: omitted Summary, Start, End, and additional fields keep
+  their stored values instead of being rewritten with defaults such as `$now`.
+- Package checks now guard shipped node metadata and any declared `main`; the
+  unused `main` entry was removed and the node metadata uses this community
+  package's namespace.
+
 ## [3.4.0]
 
 ### Fixed

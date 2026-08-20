@@ -1,5 +1,5 @@
 {
-  "node": "n8n-nodes-base.calDav",
+  "node": "n8n-nodes-caldav-pro.calDav",
   "nodeVersion": "1.0",
   "codexVersion": "1.0",
   "categories": ["Productivity"],

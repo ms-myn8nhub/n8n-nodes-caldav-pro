@@ -195,6 +195,11 @@ export const eventFields: INodeProperties[] = [
 	},
 
 	// ─────────── Event: Create / Update fields ───────────
+	// Create and Update take the same three fields under the same names, but not
+	// with the same rules. Create needs all of them and offers convenient
+	// defaults; Update is a patch, where a field left empty has to mean "leave
+	// what the server has". A "$now" default on Update moved every event whose
+	// title someone changed, so the two cases are declared separately.
 	{
 		displayName: 'Summary',
 		name: 'summary',
@@ -206,7 +211,7 @@ export const eventFields: INodeProperties[] = [
 		displayOptions: {
 			show: {
 				resource: ['event'],
-				operation: ['create', 'update'],
+				operation: ['create'],
 			},
 		},
 	},
@@ -221,7 +226,7 @@ export const eventFields: INodeProperties[] = [
 		displayOptions: {
 			show: {
 				resource: ['event'],
-				operation: ['create', 'update'],
+				operation: ['create'],
 			},
 		},
 	},
@@ -236,7 +241,50 @@ export const eventFields: INodeProperties[] = [
 		displayOptions: {
 			show: {
 				resource: ['event'],
-				operation: ['create', 'update'],
+				operation: ['create'],
+			},
+		},
+	},
+	{
+		displayName: 'Summary',
+		name: 'summary',
+		type: 'string',
+		default: '',
+		placeholder: 'Team meeting',
+		description:
+			'New title for the event. Leave empty to keep the title the event already has — an empty value means "unchanged", not "clear the title".',
+		displayOptions: {
+			show: {
+				resource: ['event'],
+				operation: ['update'],
+			},
+		},
+	},
+	{
+		displayName: 'Start',
+		name: 'start',
+		type: 'dateTime',
+		default: '',
+		description:
+			'New start time. Leave empty to keep the stored one. Same forms as on Create: a wall clock plus the Timezone field, or an explicit offset. Start and End have to be given together, so the event is never left with only one end moved.',
+		displayOptions: {
+			show: {
+				resource: ['event'],
+				operation: ['update'],
+			},
+		},
+	},
+	{
+		displayName: 'End',
+		name: 'end',
+		type: 'dateTime',
+		default: '',
+		description:
+			'New end time. Leave empty to keep the stored one. Must be given together with Start.',
+		displayOptions: {
+			show: {
+				resource: ['event'],
+				operation: ['update'],
 			},
 		},
 	},
@@ -341,7 +389,7 @@ export const eventFields: INodeProperties[] = [
 								type: 'options',
 								default: 'DISPLAY',
 								description:
-									'How the reminder is delivered. "Display" pops up a desktop/mobile notification (most common). "Email" sends an email.',
+									'How the reminder is delivered. "Display" pops up a desktop/mobile notification (most common). "Email" is only written when the event has at least one attendee, because RFC 5545 EMAIL alarms require attendees; without attendees it falls back to Display.',
 								options: [
 									{ name: 'Display', value: 'DISPLAY' },
 									{ name: 'Email', value: 'EMAIL' },

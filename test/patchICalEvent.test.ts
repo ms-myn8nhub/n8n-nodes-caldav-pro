@@ -77,6 +77,22 @@ describe('patchICalEvent — preservation', () => {
 		expect(flat.filter((l) => l === 'BEGIN:VALARM')).toHaveLength(1);
 		expect(flat).toContain('TRIGGER:-PT1H');
 	});
+
+	it('writes RFC-compliant EMAIL alarms on patch when attendees already exist', () => {
+		const out = patchICalEvent(existing, { reminders: [{ minutesBefore: 30, action: 'EMAIL' }] });
+		const flat = unfold(out);
+		expect(flat).toContain('ACTION:EMAIL');
+		expect(flat).toContain('SUMMARY:Original title');
+		expect(flat.filter((l) => l.includes('ATTENDEE') && l.includes('mailto:alice@example.com')).length).toBeGreaterThanOrEqual(2);
+	});
+
+	it('falls back to DISPLAY on patch when EMAIL reminders have no attendees', () => {
+		const noAttendees = existing.replace('ATTENDEE;CN=Alice:mailto:alice@example.com\r\n', '');
+		const out = patchICalEvent(noAttendees, { reminders: [{ minutesBefore: 30, action: 'EMAIL' }] });
+		const flat = unfold(out);
+		expect(flat).toContain('ACTION:DISPLAY');
+		expect(flat).not.toContain('ACTION:EMAIL');
+	});
 });
 
 describe('patchICalEvent — clearing', () => {
@@ -139,6 +155,29 @@ describe('patchICalEvent — date handling', () => {
 			/Start and End must be updated together/,
 		);
 	});
+
+	it('rejects timed patches whose end is not after the start', () => {
+		expect(() =>
+			patchICalEvent(existing, { start: '2026-04-20T16:00:00+02:00', end: '2026-04-20T16:00:00+02:00' }),
+		).toThrow(/End must be after Start/);
+	});
+
+	it('keeps same-day all-day patches valid by writing an exclusive next-day DTEND', () => {
+		const allDaySource = buildICalEvent({
+			uid: 'ad',
+			summary: 'Holiday',
+			start: '2026-04-20T00:00:00Z',
+			end: '2026-04-21T00:00:00Z',
+			allDay: true,
+		});
+		const out = patchICalEvent(allDaySource, {
+			start: '2026-05-01T00:00:00Z',
+			end: '2026-05-01T00:00:00Z',
+			allDay: true,
+		});
+		expect(line(out, 'DTSTART')).toBe('DTSTART;VALUE=DATE:20260501');
+		expect(line(out, 'DTEND')).toBe('DTEND;VALUE=DATE:20260502');
+	});
 });
 
 describe('patchICalEvent — bookkeeping', () => {
@@ -161,6 +200,88 @@ describe('patchICalEvent — bookkeeping', () => {
 	it('refuses to overwrite a resource that holds no VEVENT', () => {
 		const vtodo = existing.replace(/VEVENT/g, 'VTODO');
 		expect(() => patchICalEvent(vtodo, { summary: 'a' })).toThrow(/no VEVENT/);
+	});
+});
+
+describe('patchICalEvent — series master', () => {
+	/**
+	 * A series whose moved occurrence is serialised *before* its master. Nothing
+	 * in RFC 5545 fixes the order of the VEVENTs inside one object, and a server
+	 * hands back whatever the client that wrote them produced.
+	 */
+	const overrideFirst = [
+		'BEGIN:VCALENDAR',
+		'VERSION:2.0',
+		'PRODID:-//x//EN',
+		'BEGIN:VEVENT',
+		'UID:s1',
+		'DTSTAMP:20260101T000000Z',
+		'RECURRENCE-ID:20260413T100000Z',
+		'DTSTART:20260413T160000Z',
+		'DTEND:20260413T170000Z',
+		'SUMMARY:Moved occurrence',
+		'SEQUENCE:5',
+		'END:VEVENT',
+		'BEGIN:VEVENT',
+		'UID:s1',
+		'DTSTAMP:20260101T000000Z',
+		'DTSTART:20260406T100000Z',
+		'DTEND:20260406T110000Z',
+		'SUMMARY:Series master',
+		'RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=4',
+		'SEQUENCE:2',
+		'END:VEVENT',
+		'END:VCALENDAR',
+	].join('\r\n');
+
+	/** The body of each VEVENT, in the order they appear. */
+	const blocks = (ics: string) =>
+		ics
+			.split('BEGIN:VEVENT')
+			.slice(1)
+			.map((b) => b.slice(0, b.indexOf('END:VEVENT')));
+
+	it('changes the master, not whichever VEVENT happens to come first', () => {
+		// "Entire Series" used to rename only the moved occurrence, and report
+		// success while the series itself was untouched.
+		const [override, master] = blocks(patchICalEvent(overrideFirst, { summary: 'Renamed series' }));
+		expect(master).toContain('SUMMARY:Renamed series');
+		expect(master).toContain('RRULE:FREQ=WEEKLY');
+		expect(override).toContain('SUMMARY:Moved occurrence');
+	});
+
+	it('bumps the revision on the master', () => {
+		const [override, master] = blocks(patchICalEvent(overrideFirst, { summary: 'Renamed series' }));
+		expect(master).toContain('SEQUENCE:3');
+		expect(override).toContain('SEQUENCE:5');
+	});
+
+	it('still works when the master comes first', () => {
+		const masterFirst = [
+			'BEGIN:VCALENDAR',
+			'VERSION:2.0',
+			'PRODID:-//x//EN',
+			'BEGIN:VEVENT',
+			'UID:s1',
+			'DTSTAMP:20260101T000000Z',
+			'DTSTART:20260406T100000Z',
+			'DTEND:20260406T110000Z',
+			'SUMMARY:Series master',
+			'RRULE:FREQ=WEEKLY;BYDAY=MO;COUNT=4',
+			'END:VEVENT',
+			'BEGIN:VEVENT',
+			'UID:s1',
+			'DTSTAMP:20260101T000000Z',
+			'RECURRENCE-ID:20260413T100000Z',
+			'DTSTART:20260413T160000Z',
+			'DTEND:20260413T170000Z',
+			'SUMMARY:Moved occurrence',
+			'END:VEVENT',
+			'END:VCALENDAR',
+		].join('\r\n');
+		const [master, override] = blocks(patchICalEvent(masterFirst, { summary: 'Renamed series' }));
+		expect(master).toContain('SUMMARY:Renamed series');
+		expect(override).toContain('SUMMARY:Moved occurrence');
 	});
 });
 

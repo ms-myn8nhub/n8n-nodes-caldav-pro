@@ -26,9 +26,19 @@ for (const declared of [...(pkg.n8n?.nodes ?? []), ...(pkg.n8n?.credentials ?? [
 	if (!files.includes(declared)) problems.push(`n8n manifest points at a missing file: ${declared}`);
 }
 
-const required = ['package.json', 'LICENSE', 'README.md', 'CHANGELOG.md'];
+const required = ['package.json', 'LICENSE', 'README.md', 'CHANGELOG.md', 'dist/nodes/CalDav/CalDav.node.json'];
 for (const name of required) {
 	if (!files.includes(name)) problems.push(`missing from package: ${name}`);
+}
+
+const codex = JSON.parse(readFileSync(new URL('../nodes/CalDav/CalDav.node.json', import.meta.url), 'utf8'));
+const expectedCodexNode = `${pkg.name}.calDav`;
+if (codex.node !== expectedCodexNode) {
+	problems.push(`CalDav.node.json node should be ${expectedCodexNode}, got ${codex.node}`);
+}
+
+if (pkg.main && !files.includes(pkg.main)) {
+	problems.push(`package.json main points at a missing file: ${pkg.main}`);
 }
 
 // The node icon is loaded by filename at runtime, not imported, so nothing else

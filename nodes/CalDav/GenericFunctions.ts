@@ -60,6 +60,11 @@ export interface EventReminder {
 	action?: 'DISPLAY' | 'EMAIL';
 }
 
+export interface ParsedEtag {
+	value: string;
+	weak: boolean;
+}
+
 type RequestCtx = IExecuteFunctions | ILoadOptionsFunctions;
 
 const xmlParser = new XMLParser({
@@ -72,16 +77,79 @@ const xmlParser = new XMLParser({
 });
 
 /**
+ * Anything with a scheme and an authority — "https://…", but also "file://…",
+ * which must not slip through as if it were a relative path. A bare
+ * "abc:def.ics" is a legal resource name, not a URL, so the "//" is required.
+ */
+const ABSOLUTE_URL = /^[a-z][a-z0-9+.-]*:\/\//i;
+
+export function parseEtag(header: string | string[] | undefined): ParsedEtag | undefined {
+	const raw = Array.isArray(header) ? header.find((v) => String(v).trim()) : header;
+	if (!raw) return undefined;
+	const text = String(raw).trim();
+	if (!text) return undefined;
+	const quoted = /^(W\/)?"([^"]*)"$/i.exec(text);
+	if (quoted) return { value: quoted[2], weak: Boolean(quoted[1]) };
+	const weak = /^W\//i.test(text);
+	return { value: text.replace(/^W\//i, '').replace(/^"|"$/g, ''), weak };
+}
+
+export function etagValue(header: string | string[] | undefined): string | undefined {
+	return parseEtag(header)?.value;
+}
+
+export function ifMatchHeader(header: string | string[] | undefined): string | undefined {
+	const etag = parseEtag(header);
+	return etag && !etag.weak ? `"${etag.value}"` : undefined;
+}
+
+/**
  * Absolutise a possibly-relative href returned by the server (CalDAV servers
  * often return path-only hrefs like "/calendars/user/uuid/"). We resolve
  * against the credential's serverUrl origin.
+ *
+ * An href that already names an origin must name *this* one. Every request the
+ * node makes goes out through httpRequestWithAuthentication, which attaches the
+ * credential's Basic auth from the credential rather than from the URL — so a
+ * request aimed at another host would hand that host the account's password.
+ * Event URL, Calendar, Target Calendar and the credential's Default Calendar
+ * are all free text that ends up here, and when the node runs as an AI Agent
+ * tool their values can come from event text the agent has just read.
+ *
+ * Only the origin is compared. Calendars live at wildly different paths across
+ * providers, and constraining those would break legitimate setups.
  */
-export function absoluteUrl(href: string, baseUrl: string): string {
+export function absoluteUrl(href: string, baseUrl: string, field = 'The URL'): string {
 	if (!href) return href;
-	if (/^https?:\/\//i.test(href)) return href;
-	const base = new URL(baseUrl);
+	let base: URL;
+	try {
+		base = new URL(baseUrl);
+	} catch {
+		throw new Error(
+			`The CalDAV server URL is not a valid URL: "${baseUrl}". Check "Server URL" in the credential.`,
+		);
+	}
+	if (ABSOLUTE_URL.test(href)) {
+		let origin: string;
+		try {
+			origin = new URL(href).origin;
+		} catch {
+			throw new Error(`${field} is not a valid URL: ${href}`);
+		}
+		if (origin !== base.origin) {
+			throw new Error(
+				`${field} points at ${origin}, but the configured CalDAV server is ${base.origin}. ` +
+					'Refusing to send the credential there. Use a URL on the configured server, or ' +
+					'change "Server URL" in the CalDAV credential if the calendar really lives elsewhere.',
+			);
+		}
+		return href;
+	}
 	return `${base.origin}${href.startsWith('/') ? '' : '/'}${href}`;
 }
+
+/** Where an href in a multistatus response came from, for error messages. */
+const SERVER_HREF = 'A URL returned by the CalDAV server';
 
 /**
  * Low-level authenticated CalDAV request. Uses httpRequestWithAuthentication
@@ -173,7 +241,7 @@ export async function discoverCalendarHome(
 			const resp = await davRequest.call(this, 'PROPFIND', url, principalBody, { Depth: '0' });
 			for (const r of extractResponses(resp.body)) {
 				const href = getFirstPropstat(r)?.prop?.['current-user-principal']?.href;
-				if (href) return absoluteUrl(href, serverUrl);
+				if (href) return absoluteUrl(href, serverUrl, SERVER_HREF);
 			}
 		} catch (e) {
 			logger?.debug(`[CalDAV] principal probe ${url} failed: ${(e as Error).message}`);
@@ -187,7 +255,7 @@ export async function discoverCalendarHome(
 			for (const r of extractResponses(resp.body)) {
 				const href = getFirstPropstat(r)?.prop?.['calendar-home-set']?.href;
 				if (href) {
-					const home = absoluteUrl(href, serverUrl);
+					const home = absoluteUrl(href, serverUrl, SERVER_HREF);
 					return home.endsWith('/') ? home : `${home}/`;
 				}
 			}
@@ -254,8 +322,9 @@ export async function resolveDefaultCalendar(
 			'No default calendar configured. Open the CalDAV credential and set "Default Calendar", or pick a specific calendar in the node.',
 		);
 	}
-	if (/^https?:\/\//i.test(hint)) {
-		return hint.endsWith('/') ? hint : `${hint}/`;
+	if (ABSOLUTE_URL.test(hint)) {
+		const url = absoluteUrl(hint, serverUrl, 'The credential\'s Default Calendar');
+		return url.endsWith('/') ? url : `${url}/`;
 	}
 	const calendars = await discoverCalendars.call(this, serverUrl, username);
 	const lower = hint.toLowerCase();
@@ -409,7 +478,7 @@ async function discoverCalendarsUncached(
 		const displayName =
 			typeof display === 'string' ? display : (display?.['#text'] ?? href);
 		calendars.push({
-			url: absoluteUrl(href, serverUrl),
+			url: absoluteUrl(href, serverUrl, SERVER_HREF),
 			displayName: String(displayName).trim() || href,
 			color: prop?.['calendar-color'],
 			ctag: prop?.['getctag'],
@@ -525,6 +594,12 @@ function wallClockInZone(d: Date, tz: string): WallClock {
 		minute: get('minute'),
 		second: get('second'),
 	};
+}
+
+export function localDateString(d: Date, tz: string): string {
+	const w = wallClockInZone(d, tz);
+	const pad = (n: number) => String(n).padStart(2, '0');
+	return `${w.year}-${pad(w.month)}-${pad(w.day)}`;
 }
 
 function isKnownZone(tz: string): boolean {
@@ -786,8 +861,13 @@ function applyDateRange(vevent: any, start: string, end: string, allDay: boolean
 		setDateProperty(vevent, 'dtend', e, undefined, true);
 		return;
 	}
-	setDateProperty(vevent, 'dtstart', timedTime(start, 'Start', tz), tz, false);
-	setDateProperty(vevent, 'dtend', timedTime(end, 'End', tz), tz, false);
+	const s = timedTime(start, 'Start', tz);
+	const e = timedTime(end, 'End', tz);
+	if (e.compare(s) <= 0) {
+		throw new Error('End must be after Start for timed events.');
+	}
+	setDateProperty(vevent, 'dtstart', s, tz, false);
+	setDateProperty(vevent, 'dtend', e, tz, false);
 }
 
 function utcNow(): any {
@@ -822,12 +902,21 @@ function setReminders(vevent: any, reminders: EventReminder[], description: stri
 	for (const existing of vevent.getAllSubcomponents('valarm')) {
 		vevent.removeSubcomponent(existing);
 	}
+	const eventAttendees = vevent.getAllProperties('attendee');
 	for (const r of reminders) {
 		const alarm = new ICAL.Component('valarm');
-		alarm.addPropertyWithValue('action', (r.action ?? 'DISPLAY').toUpperCase());
+		const requestedAction = (r.action ?? 'DISPLAY').toUpperCase();
+		const action = requestedAction === 'EMAIL' && eventAttendees.length === 0 ? 'DISPLAY' : requestedAction;
+		alarm.addPropertyWithValue('action', action);
 		const mins = Math.max(0, Math.floor(r.minutesBefore));
 		alarm.addPropertyWithValue('trigger', ICAL.Duration.fromSeconds(-mins * 60));
 		alarm.addPropertyWithValue('description', description || 'Reminder');
+		if (action === 'EMAIL') {
+			alarm.addPropertyWithValue('summary', description || 'Reminder');
+			for (const attendee of eventAttendees) {
+				alarm.addProperty(new ICAL.Property(attendee.toJSON(), alarm));
+			}
+		}
 		vevent.addSubcomponent(alarm);
 	}
 }
@@ -968,7 +1057,10 @@ function masterOf(comp: any): any {
 
 export function patchICalEvent(raw: string, patch: PatchEventInput): string {
 	const comp = new ICAL.Component(ICAL.parse(raw));
-	const vevent = comp.getFirstSubcomponent('vevent');
+	// The master, not the first component: nothing fixes the order of the
+	// VEVENTs inside one object, and taking the first one renamed a moved
+	// occurrence while leaving the series it belongs to untouched.
+	const vevent = masterOf(comp);
 	if (!vevent) {
 		throw new Error('The stored calendar resource contains no VEVENT — refusing to overwrite it.');
 	}
@@ -1362,7 +1454,7 @@ export async function resolveEventUrl(
 	serverUrl?: string,
 ): Promise<string> {
 	const explicit = (explicitUrl ?? '').trim();
-	if (explicit) return absoluteUrl(explicit, serverUrl || calendarUrl);
+	if (explicit) return absoluteUrl(explicit, serverUrl || calendarUrl, 'Event URL');
 
 	const logger = (this as IExecuteFunctions).logger;
 	if (uid) {
@@ -1378,7 +1470,7 @@ export async function resolveEventUrl(
 			if (hrefs.length > 1) {
 				logger?.debug(`[CalDAV] UID ${uid} matched ${hrefs.length} resources; using the first`);
 			}
-			if (hrefs.length) return absoluteUrl(hrefs[0], serverUrl || calendarUrl);
+			if (hrefs.length) return absoluteUrl(hrefs[0], serverUrl || calendarUrl, SERVER_HREF);
 			logger?.debug(`[CalDAV] UID ${uid} not found by query; falling back to <uid>.ics`);
 		} catch (e) {
 			logger?.debug(`[CalDAV] UID lookup failed (${(e as Error).message}); falling back`);
@@ -1451,9 +1543,9 @@ export function parseCalendarQueryResponse(
 		const calData = prop['calendar-data'];
 		const raw = typeof calData === 'string' ? calData : calData?.['#text'];
 		if (!raw) continue;
-		const etag = (prop.getetag ?? '').toString().replace(/"/g, '');
-		const url = absoluteUrl(href, serverUrl || calendarUrl);
-		events.push(...expandCalendarObject(raw, url, etag || undefined, rangeStart, rangeEnd, localZone));
+		const etag = etagValue(prop.getetag);
+		const url = absoluteUrl(href, serverUrl || calendarUrl, SERVER_HREF);
+		events.push(...expandCalendarObject(raw, url, etag, rangeStart, rangeEnd, localZone));
 	}
 	return events;
 }
