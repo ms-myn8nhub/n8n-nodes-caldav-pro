@@ -1,0 +1,404 @@
+diff --git a/README.md b/README.md
+index f5e5e66..ce82996 100644
+--- a/README.md
++++ b/README.md
+@@ -191,40 +191,69 @@ available.
+ 
+ ## AI Agent Usage
+ 
+-The node is declared `usableAsTool: true` with LLM-friendly descriptions on every parameter. An AI Agent can call it directly from a chat prompt. Example:
++The node is declared `usableAsTool: true`, so it can be attached to an AI Agent.
++Two things about how n8n builds a tool out of a node decide how you have to wire
++it up — get them wrong and the agent will keep answering with the wrong thing
++(most commonly: the list of calendars, whatever you asked for):
++
++1. **Resource and Operation are chosen by you, not by the model.** Both are
++   declared `noDataExpression: true`, which is what n8n requires of these two
++   fields, and it means they can never hold an expression — so `$fromAI()`
++   cannot reach them. **One tool node = exactly one operation.** A tool node
++   left on *Calendar → Get Many* answers every prompt with the calendar list,
++   including "what's on tomorrow" and "create a meeting".
++2. **The tool's input schema is built only from `$fromAI()` placeholders.**
++   n8n scans the node's parameters for `$fromAI(...)` and turns each one into a
++   tool argument. A field filled with a fixed value stays fixed; a field the
++   model should decide has to contain `$fromAI()` explicitly.
++
++### Recommended wiring
++
++Give the agent one CalDAV node per thing it may do, each **renamed** (the node
++name becomes the tool name the model sees) and each with **Description → Set
++manually**, because the auto description collapses to a bare
++`"Get many events in CalDAV"` and drops everything this node documents about its
++fields:
++
++| Node name (tool name) | Resource / Operation | Fields to fill with `$fromAI()` |
++| --- | --- | --- |
++| `calendar_list`       | Calendar / Get Many | — |
++| `events_in_range`     | Event / Get Many    | Time Min, Time Max |
++| `next_events`         | Event / Get Next    | Lookahead Days |
++| `search_events`       | Event / Search      | Query, Time Min, Time Max |
++| `create_event`        | Event / Create      | Summary, Start, End, additional fields |
++| `update_event`        | Event / Update      | Event URL (or UID), Summary, Start, End |
++| `delete_event`        | Event / Delete      | Event URL (or UID), Occurrence |
++
++Example of a field the model fills, on *Event → Get Many → Time Min*:
+ 
+-> *"Create a calendar event in my primary calendar for tomorrow at 14:00 Berlin
+-> time. Title: 'Kickoff with customer'. Duration: 1 hour. Location: 'Zoom — link
+-> in the invite'. Invite alice@example.com and bob@example.com. Remind me 1 day
+-> and 15 minutes before."*
+-
+-The agent will populate:
++```
++={{ $fromAI('timeMin', 'Start of the window, ISO 8601 with offset', 'string') }}
++```
+ 
+-- `resource` = `event`, `operation` = `create`
+-- `calendar` = picked from the dropdown via `getCalendars`
+-- `summary` = `"Kickoff with customer"`
+-- `start` = `"2026-04-22T14:00:00+02:00"`, `end` = `"2026-04-22T15:00:00+02:00"`
+-- `additionalFields.timezone` = `"Europe/Berlin"`
+-- `additionalFields.location` = `"Zoom — link in the invite"`
+-- `additionalFields.attendees` = two attendee objects
+-- `additionalFields.reminders` = `[{minutesBefore: 1440}, {minutesBefore: 15}]`
++Leave **Calendar** on a fixed pick (or on *🏠 Default Calendar (From
++Credentials)*) unless the agent genuinely has to choose; letting the model
++invent a calendar URL is the most common source of 404s.
+ 
+ ### Recommended system prompt
+ 
+ ```
+-You are a calendar assistant with access to a CalDAV tool.
++You are a calendar assistant with access to CalDAV tools.
+ 
+ - Convert any time/date mentioned by the user to ISO 8601 with
+-  the Europe/Berlin timezone offset before calling the tool.
++  the Europe/Berlin timezone offset before calling a tool.
+   Current time: {{ $now.toISO() }}.
+ - Always include "timezone": "Europe/Berlin" in additionalFields.
++- To answer "what is on <date>", call events_in_range — calendar_list
++  only returns calendar names and never contains any event.
++- Read startLocal/endLocal when telling the user when something is;
++  start/end are UTC instants meant for sorting, not for reading out.
+ - Before creating: confirm title, start, end in one short sentence.
+ - Before deleting: always confirm with the event UID.
+ - If the user is vague ("irgendwann"), ask one clarifying question.
+-- Use the default calendar (first one returned by getCalendars)
+-  unless the user names a specific one.
+ ```
+ 
++
+ ## Tested with
+ 
+ | Provider                 | Status               | Notes                                                                                                                                                              |
+diff --git a/nodes/CalDav/CalDav.node.ts b/nodes/CalDav/CalDav.node.ts
+index 3e872ef..1fc738a 100644
+--- a/nodes/CalDav/CalDav.node.ts
++++ b/nodes/CalDav/CalDav.node.ts
+@@ -165,8 +165,15 @@ function readWindowBound(
+ 	itemIndex: number,
+ 	parameter: string,
+ 	label: string,
++	fallback: Date,
+ ): Date {
+-	const raw = this.getNodeParameter(parameter, itemIndex) as string;
++	// A fallback is required, not optional: a parameter that is not *displayed*
++	// for the current resource/operation is absent from the resolved parameters,
++	// and reading it without one throws "Could not get parameter". That happens
++	// whenever Operation is driven by an expression — the shape an AI Agent tool
++	// takes — so the window has to survive the field being invisible.
++	const raw = this.getNodeParameter(parameter, itemIndex, '') as string;
++	if (raw === '' || raw === undefined || raw === null) return fallback;
+ 	const parsed = new Date(raw);
+ 	if (Number.isNaN(parsed.getTime())) {
+ 		throw new NodeOperationError(this.getNode(), `${label} is not a valid date: "${raw}"`, {
+@@ -218,8 +225,15 @@ function readWindow(
+ 		};
+ 	}
+ 
+-	const rangeStart = readWindowBound.call(this, itemIndex, 'timeMin', 'Time Min');
+-	const rangeEnd = readWindowBound.call(this, itemIndex, 'timeMax', 'Time Max');
++	const now = new Date();
++	const rangeStart = readWindowBound.call(this, itemIndex, 'timeMin', 'Time Min', now);
++	const rangeEnd = readWindowBound.call(
++		this,
++		itemIndex,
++		'timeMax',
++		'Time Max',
++		new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000),
++	);
+ 	// An inverted or empty window is silently answered with an empty result by
+ 	// the server, which reads as "no events" rather than as the mistake it is.
+ 	if (rangeEnd.getTime() <= rangeStart.getTime()) {
+@@ -234,7 +248,7 @@ function readWindow(
+ 		);
+ 	}
+ 	if (operation === 'search') {
+-		const query = this.getNodeParameter('query', itemIndex) as string;
++		const query = this.getNodeParameter('query', itemIndex, '') as string;
+ 		return { rangeStart, rangeEnd, accept: (event) => eventMatchesText(event, query) };
+ 	}
+ 	return { rangeStart, rangeEnd };
+@@ -362,9 +376,23 @@ export class CalDav implements INodeType {
+ 				type: 'options',
+ 				noDataExpression: true,
+ 				options: [
+-					{ name: 'Calendar', value: 'calendar' },
+-					{ name: 'Event', value: 'event' },
+-					{ name: 'ICS Feed (Read-Only)', value: 'icsFeed' },
++					{
++						name: 'Calendar',
++						value: 'calendar',
++						description:
++							'The calendars themselves: their names, URLs and colours. Returns no events — pick "Event" to read what is in a calendar.',
++					},
++					{
++						name: 'Event',
++						value: 'event',
++						description:
++							'The events inside a calendar: read them (Get, Get Many, Get Next, Search) or write them (Create, Update, Move, Delete)',
++					},
++					{
++						name: 'ICS Feed (Read-Only)',
++						value: 'icsFeed',
++						description: 'Events from a subscribed ICS/WebCal feed, read over plain HTTPS',
++					},
+ 				],
+ 				default: 'event',
+ 			},
+@@ -452,11 +480,16 @@ export class CalDav implements INodeType {
+ 					} else {
+ 						throw new NodeOperationError(
+ 							this.getNode(),
+-							`Unknown calendar operation: ${operation}`,
++							`Unknown calendar operation: "${operation}"`,
++							{
++								itemIndex: i,
++								description:
++									'The Calendar resource supports only "getAll" (Get Many). To read or write events, set Resource to "Event"; the operation that lists events is Event > Get Many.',
++							},
+ 						);
+ 					}
+ 				} else if (resource === 'event') {
+-					const calendarUrl = this.getNodeParameter('calendar', i) as string;
++					const calendarUrl = this.getNodeParameter('calendar', i, '') as string;
+ 					if (!calendarUrl) {
+ 						throw new NodeOperationError(
+ 							this.getNode(),
+@@ -548,7 +581,25 @@ export class CalDav implements INodeType {
+ 								'Content-Type': 'text/calendar; charset=utf-8',
+ 								'If-None-Match': '*',
+ 							})
+-							.catch((err) => rethrowWriteError.call(this, err, i, calUrlNormalised));
++							.catch((err) => {
++								// "If-None-Match: *" makes the create fail rather than
++								// overwrite when something already lives at that URL. The
++								// server answers with a bare 412, which n8n renders as
++								// "Your request is invalid or could not be processed" —
++								// true, but it names neither the UID nor the collision.
++								if ((err as { httpCode?: string }).httpCode === '412') {
++									throw new NodeOperationError(
++										this.getNode(),
++										`An event with UID "${uid}" already exists in this calendar, so nothing was created.`,
++										{
++											itemIndex: i,
++											description:
++												'Leave the UID field empty to let the node generate a unique one, use a different UID, or use the Update operation to change the existing event.',
++										},
++									);
++								}
++								return rethrowWriteError.call(this, err, i, calUrlNormalised);
++							});
+ 						const etag = etagValue(resp.headers.etag);
+ 						returnData.push({
+ 							json: { uid, url: eventUrl, etag, summary, start, end },
+@@ -577,8 +628,10 @@ export class CalDav implements INodeType {
+ 					} else if (operation === 'getAll' || operation === 'getNext' || operation === 'search') {
+ 						// The three reads differ only in the window they ask for and the
+ 						// predicate they apply; everything else is shared.
+-						const returnAll = this.getNodeParameter('returnAll', i) as boolean;
+-						const limit = returnAll ? Infinity : (this.getNodeParameter('limit', i) as number);
++						const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
++						const limit = returnAll
++							? Infinity
++							: (this.getNodeParameter('limit', i, 50) as number);
+ 						const simplify = this.getNodeParameter('simplify', i, true) as boolean;
+ 						const { rangeStart, rangeEnd, accept } = readWindow.call(this, i, operation);
+ 
+@@ -595,7 +648,7 @@ export class CalDav implements INodeType {
+ 							returnData.push({ json: ev, pairedItem: { item: i } });
+ 						}
+ 					} else if (operation === 'move') {
+-						const targetCalendarRaw = this.getNodeParameter('targetCalendar', i) as string;
++						const targetCalendarRaw = this.getNodeParameter('targetCalendar', i, '') as string;
+ 						if (!targetCalendarRaw) {
+ 							throw new NodeOperationError(this.getNode(), 'Target Calendar is required for the Move operation.', { itemIndex: i });
+ 						}
+@@ -845,7 +898,15 @@ export class CalDav implements INodeType {
+ 						}
+ 						returnData.push({ json: { uid, url: eventUrl, deleted: true }, pairedItem: { item: i } });
+ 					} else {
+-						throw new NodeOperationError(this.getNode(), `Unknown event operation: ${operation}`);
++						throw new NodeOperationError(
++							this.getNode(),
++							`Unknown event operation: "${operation}"`,
++							{
++								itemIndex: i,
++								description:
++									'Valid Event operations are: create, delete, get, getAll, getNext, move, search, update.',
++							},
++						);
+ 					}
+ 				} else if (resource === 'icsFeed') {
+ 					if (!['getAll', 'getNext', 'search'].includes(operation)) {
+@@ -875,8 +936,8 @@ export class CalDav implements INodeType {
+ 						});
+ 					}
+ 
+-					const returnAll = this.getNodeParameter('returnAll', i) as boolean;
+-					const limit = returnAll ? Infinity : (this.getNodeParameter('limit', i) as number);
++					const returnAll = this.getNodeParameter('returnAll', i, false) as boolean;
++					const limit = returnAll ? Infinity : (this.getNodeParameter('limit', i, 50) as number);
+ 					const simplify = this.getNodeParameter('simplify', i, true) as boolean;
+ 					const { rangeStart, rangeEnd, accept } = readWindow.call(this, i, operation);
+ 
+@@ -904,7 +965,11 @@ export class CalDav implements INodeType {
+ 						});
+ 					}
+ 				} else {
+-					throw new NodeOperationError(this.getNode(), `Unknown resource: ${resource}`);
++					throw new NodeOperationError(this.getNode(), `Unknown resource: "${resource}"`, {
++						itemIndex: i,
++						description:
++							'Valid resources are "calendar" (list the calendars themselves), "event" (read and write events in a CalDAV calendar) and "icsFeed" (read a subscribed ICS feed). Note that Resource and Operation are chosen in the node itself and cannot be filled by an AI Agent — see the AI Agent section of the README.',
++					});
+ 				}
+ 			} catch (error) {
+ 				if (this.continueOnFail()) {
+diff --git a/nodes/CalDav/CalendarDescription.ts b/nodes/CalDav/CalendarDescription.ts
+index 644df83..bb9a2b1 100644
+--- a/nodes/CalDav/CalendarDescription.ts
++++ b/nodes/CalDav/CalendarDescription.ts
+@@ -13,14 +13,33 @@ export const calendarOperations: INodeProperties[] = [
+ 		},
+ 		options: [
+ 			{
++				// Both this resource and the Event resource have an operation labelled
++				// "Get Many", and the Calendar one is the alphabetically first action
++				// n8n offers for the node. Landing on it while meaning "get my events"
++				// is the single most reported confusion with this node, so the label
++				// says what comes back rather than just the verb.
+ 				name: 'Get Many',
+ 				value: 'getAll',
+-				description: 'List many CalDAV calendars available to the authenticated user',
+-				action: 'Get many calendars',
++				description:
++					'List the calendars available to the authenticated user — names, URLs, colours and whether each is read-only. Returns no events.',
++				action: 'Get many calendars not their events',
+ 			},
+ 		],
+ 		default: 'getAll',
+ 	},
+ ];
+ 
+-export const calendarFields: INodeProperties[] = [];
++export const calendarFields: INodeProperties[] = [
++	{
++		displayName:
++			'This returns your <b>calendars</b>, not their contents. To read events — "what is on tomorrow", "the next meeting", a keyword search — set <b>Resource</b> to <b>Event</b> and use Get Many, Get Next or Search there.',
++		name: 'calendarResourceNotice',
++		type: 'notice',
++		default: '',
++		displayOptions: {
++			show: {
++				resource: ['calendar'],
++			},
++		},
++	},
++];
+diff --git a/test/parameterFallbacks.test.ts b/test/parameterFallbacks.test.ts
+new file mode 100644
+index 0000000..6e32b1d
+--- /dev/null
++++ b/test/parameterFallbacks.test.ts
+@@ -0,0 +1,80 @@
++import { describe, expect, it, vi } from 'vitest';
++import { CalDav } from '../nodes/CalDav/CalDav.node';
++
++/**
++ * A parameter that is not *displayed* for the current resource/operation is
++ * absent from the parameters n8n resolves for an execution, so reading it
++ * without a fallback throws "Could not get parameter". That is not a corner
++ * case: it is the shape the node takes the moment Operation is driven by an
++ * expression, which is how the node has to be wired for an AI Agent.
++ *
++ * These tests execute the node with a context that returns the fallback for
++ * anything the caller did not set, exactly as n8n does.
++ */
++
++const SERVER = 'https://dav.example.com/';
++const WORK = 'https://dav.example.com/calendars/bob/work/';
++
++function makeContext(params: Record<string, unknown>, putStatus = 201) {
++	const requests: Array<{ method: string; url: string; body?: string }> = [];
++	const httpRequestWithAuthentication = vi.fn(async (_cred: string, o: any) => {
++		requests.push({ method: o.method, url: o.url, body: String(o.body ?? '') });
++		if (o.method === 'REPORT') {
++			return { statusCode: 207, headers: {}, body: '<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"/>' };
++		}
++		if (o.method === 'PUT') {
++			return { statusCode: putStatus, headers: { etag: '"w1"' }, body: '' };
++		}
++		throw new Error(`unexpected ${o.method} ${o.url}`);
++	});
++	return {
++		requests,
++		getInputData: () => [{ json: {} }],
++		getNode: () => ({ name: 'CalDAV', type: 'calDav', typeVersion: 1, id: 'n1' }),
++		getTimezone: () => 'Europe/Berlin',
++		getCredentials: async () => ({ serverUrl: SERVER, username: 'bob', password: 'p' }),
++		getNodeParameter: (name: string, _i: number, fallback?: unknown) =>
++			name in params ? params[name] : fallback,
++		continueOnFail: () => false,
++		logger: { debug: vi.fn() },
++		helpers: { httpRequestWithAuthentication },
++	};
++}
++
++describe('hidden parameters fall back instead of throwing', () => {
++	it('Get Many still queries a window when Time Min / Time Max are not displayed', async () => {
++		const ctx = makeContext({ resource: 'event', operation: 'getAll', calendar: WORK });
++		const [items] = await new CalDav().execute.call(ctx as any);
++		expect(items).toEqual([]);
++		const report = ctx.requests.find((r) => r.method === 'REPORT');
++		expect(report?.url).toBe(WORK);
++		// A real, non-empty window reached the server rather than "NaNNaNNaN".
++		expect(report?.body).toMatch(/<c:time-range start="\d{8}T\d{6}Z" end="\d{8}T\d{6}Z"\/>/);
++	});
++
++	it('Search without a displayed Query returns the window rather than failing', async () => {
++		const ctx = makeContext({ resource: 'event', operation: 'search', calendar: WORK });
++		const [items] = await new CalDav().execute.call(ctx as any);
++		expect(items).toEqual([]);
++	});
++});
++
++describe('create with a UID that already exists', () => {
++	it('names the collision instead of passing a bare 412 through', async () => {
++		const ctx = makeContext(
++			{
++				resource: 'event',
++				operation: 'create',
++				calendar: WORK,
++				summary: 'Lunch',
++				start: '2026-04-20T12:00:00+02:00',
++				end: '2026-04-20T13:00:00+02:00',
++				additionalFields: { uid: 'already-there' },
++			},
++			412,
++		);
++		await expect(new CalDav().execute.call(ctx as any)).rejects.toThrow(
++			/UID "already-there" already exists/,
++		);
++	});
++});
